@@ -416,14 +416,15 @@ impl TLS13MessageDecrypter {
 /// TLS1.3 uses `TLS13MessageEncrypter`.
 pub struct ChaCha20Poly1305MessageEncrypter {
     enc_key: aead::LessSafeKey,
+    enc_key_raw: Vec<u8>,
     enc_offset: Iv,
 }
 
 /// The RFC7905/RFC7539 ChaCha20Poly1305 construction.
 /// This implementation does the AAD construction required in TLS1.2.
 /// TLS1.3 uses `TLS13MessageDecrypter`.
-pub struct ChaCha20Poly1305MessageDecrypter {
-    dec_key: aead::LessSafeKey,
+pub struct ChaCha20Poly1305MessageDecrypter { 
+    dec_key_raw: Vec<u8>,
     dec_offset: Iv,
 }
 
@@ -435,6 +436,7 @@ impl ChaCha20Poly1305MessageEncrypter {
             .unwrap();
         ChaCha20Poly1305MessageEncrypter {
             enc_key: aead::LessSafeKey::new(key),
+            enc_key_raw: enc_key.to_vec(),
             enc_offset: enc_iv,
         }
     }
@@ -444,10 +446,8 @@ impl ChaCha20Poly1305MessageDecrypter {
     fn new(alg: &'static aead::Algorithm,
            dec_key: &[u8],
            dec_iv: Iv) -> ChaCha20Poly1305MessageDecrypter {
-        let key = aead::UnboundKey::new(alg, dec_key)
-            .unwrap();
         ChaCha20Poly1305MessageDecrypter {
-            dec_key: aead::LessSafeKey::new(key),
+            dec_key_raw: dec_key.to_vec(),
             dec_offset: dec_iv,
         }
     }
@@ -457,20 +457,23 @@ const CHACHAPOLY1305_OVERHEAD: usize = 16;
 
 impl MessageDecrypter for ChaCha20Poly1305MessageDecrypter {
     fn decrypt(&self, mut msg: Message, seq: u64) -> Result<Message, TLSError> {
+        use orion::hazardous::aead::chacha20poly1305 as orion_aead;
+
         let payload = msg.take_opaque_payload()
-            .ok_or(TLSError::DecryptError)?;
-        let mut buf = payload.0;
+        .ok_or(TLSError::DecryptError)?;
+        let mut buf = payload.0.to_vec();
 
         if buf.len() < CHACHAPOLY1305_OVERHEAD {
             return Err(TLSError::DecryptError);
         }
 
-        let nonce = make_tls13_nonce(&self.dec_offset, seq);
+        let orion_key = orion_aead::SecretKey::from_slice(&self.dec_key_raw).unwrap();
+        let orion_nonce =
+            orion_aead::Nonce::from(*make_tls13_nonce(&self.dec_offset, seq).as_ref());
         let aad = make_tls12_aad(seq, msg.typ, msg.version, buf.len() - CHACHAPOLY1305_OVERHEAD);
 
-        let plain_len = self.dec_key.open_in_place(nonce, aad, &mut buf)
-            .map_err(|_| TLSError::DecryptError)?
-            .len();
+        orion_aead::open(&orion_key, &orion_nonce, payload.0.as_ref(), Some(aad.as_ref()), &mut buf).map_err(|_| TLSError::DecryptError)?;
+        let plain_len = buf.len() - CHACHAPOLY1305_OVERHEAD;
 
         if plain_len > MAX_FRAGMENT_LEN {
             return Err(TLSError::PeerSentOversizedRecord);
@@ -488,15 +491,23 @@ impl MessageDecrypter for ChaCha20Poly1305MessageDecrypter {
 
 impl MessageEncrypter for ChaCha20Poly1305MessageEncrypter {
     fn encrypt(&self, msg: BorrowMessage, seq: u64) -> Result<Message, TLSError> {
-        let nonce = make_tls13_nonce(&self.enc_offset, seq);
+        use orion::hazardous::aead::chacha20poly1305 as orion_aead;
+
+        let orion_key = orion_aead::SecretKey::from_slice(&self.enc_key_raw).unwrap();
+        let orion_nonce =
+            orion_aead::Nonce::from(*make_tls13_nonce(&self.enc_offset, seq).as_ref());
         let aad = make_tls12_aad(seq, msg.typ, msg.version, msg.payload.len());
 
         let total_len = msg.payload.len() + self.enc_key.algorithm().tag_len();
-        let mut buf = Vec::with_capacity(total_len);
-        buf.extend_from_slice(&msg.payload);
-
-        self.enc_key.seal_in_place_append_tag(nonce, aad, &mut buf)
-            .map_err(|_| TLSError::General("encrypt failed".to_string()))?;
+        let mut buf = vec![0u8; total_len];
+        orion_aead::seal(
+            &orion_key,
+            &orion_nonce,
+            msg.payload,
+            Some(aad.as_ref()),
+            &mut buf,
+        )
+        .map_err(|_| TLSError::General("encrypt failed".to_string()))?;
 
         Ok(Message {
             typ: msg.typ,
